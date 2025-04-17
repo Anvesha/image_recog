@@ -41,6 +41,7 @@ def reset_attendance_table():
     conn.execute("DROP TABLE IF EXISTS attendance")
     conn.commit()
     conn.close()
+    conn.close()
 
 reset_attendance_table()  # <-- Run once
 init_database()
