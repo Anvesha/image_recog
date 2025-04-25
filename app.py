@@ -1,5 +1,4 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
+from flask import Flask, request, jsonify
 from PIL import Image
 import cv2
 import os
@@ -8,7 +7,9 @@ import numpy as np
 from datetime import datetime
 import sqlite3
 
-# --------- Utilities ---------
+app = Flask(__name__)
+
+# --------- Setup ---------
 def assure_path_exists(path):
     if not os.path.exists(path):
         os.makedirs(path)
@@ -35,69 +36,53 @@ def init_database():
     conn.commit()
     conn.close()
 
-# --------- One-time Reset for Attendance Table ---------
-def reset_attendance_table():
-    conn = sqlite3.connect("attendance_system.db")
-    conn.execute("DROP TABLE IF EXISTS attendance")
-    conn.commit()
-    conn.close()
-    conn.close()
-
-reset_attendance_table()  # <-- Run once
 init_database()
 
-# --------- Image Capture & Training ---------
-def TakeImages():
-    Id = id_entry.get()
-    name = name_entry.get()
-    serial = serial_entry.get()
+# --------- Face Capture & Training ---------
+@app.route('/register', methods=['POST'])
+def register_student():
+    data = request.json
+    Id = str(data.get("id"))
+    name = str(data.get("name"))
+    serial = str(data.get("serial"))
 
-    if not Id.isnumeric() or not name.isalpha() or not serial.isnumeric():
-        messagebox.showerror("Error", "Enter valid Serial (number), ID (number), and Name (letters only).")
-        return
+    if not Id.isnumeric() or not serial.isnumeric() or not name.isalpha():
+        return jsonify({"error": "Invalid input"}), 400
 
     cam = cv2.VideoCapture(0)
     detector = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
     assure_path_exists("TrainingImage")
+    assure_path_exists("StudentDetails")
     face_captured = False
 
     while True:
         ret, img = cam.read()
         if not ret:
-            messagebox.showerror("Error", "Failed to access camera.")
-            return
+            return jsonify({"error": "Camera not accessible"}), 500
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(100, 100))
+        faces = detector.detectMultiScale(gray, 1.1, 4)
 
         for (x, y, w, h) in faces:
             file_path = os.path.join("TrainingImage", f"{name}.{serial}.{Id}.jpg")
-            if os.path.exists(file_path): os.remove(file_path)
-            cv2.imwrite(file_path, gray[y:y + h, x:x + w])
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            cv2.imwrite(file_path, gray[y:y+h, x:x+w])
             face_captured = True
             break
 
-        for (x, y, w, h) in faces:
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-        cv2.imshow("Face Capture - Press Q to Exit", img)
-        if face_captured or cv2.waitKey(1) & 0xFF == ord('q'):
+        if face_captured:
             break
 
     cam.release()
     cv2.destroyAllWindows()
 
     if not face_captured:
-        messagebox.showwarning("Warning", "No face detected. Try again.")
-        return
+        return jsonify({"error": "No face detected"}), 400
 
-    # Save to CSV
-    assure_path_exists("StudentDetails")
     with open("StudentDetails/StudentDetails.csv", 'a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([serial, Id, name])
+        csv.writer(f).writerow([serial, Id, name])
 
-    # Save to DB
     conn = sqlite3.connect("attendance_system.db")
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO students (serial, id, name, image_path) VALUES (?, ?, ?, ?)", 
@@ -105,8 +90,9 @@ def TakeImages():
     conn.commit()
     conn.close()
 
-    messagebox.showinfo("Success", f"Image saved & student registered!\nID: {Id}, Name: {name}")
-    TrainImages()
+    train_images()
+
+    return jsonify({"message": "Student registered and model trained"}), 200
 
 def getImagesAndLabels(path):
     faces, Ids = [], []
@@ -122,26 +108,23 @@ def getImagesAndLabels(path):
             continue
     return faces, Ids
 
-def TrainImages():
+def train_images():
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     assure_path_exists("TrainingImageLabel")
     faces, Ids = getImagesAndLabels("TrainingImage")
-
     if not faces:
-        messagebox.showerror("Error", "No face data found!")
         return
-
     recognizer.train(faces, np.array(Ids))
     recognizer.save("TrainingImageLabel/Trainner.yml")
 
-# --------- Recognition & Attendance ---------
-def RecognizeAndMarkAttendance():
+# --------- Recognition ---------
+@app.route('/recognize', methods=['POST'])
+def recognize_and_mark_attendance():
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     try:
         recognizer.read("TrainingImageLabel/Trainner.yml")
     except:
-        messagebox.showerror("Error", "Train the model first!")
-        return
+        return jsonify({"error": "Model not trained"}), 500
 
     cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
     conn = sqlite3.connect("attendance_system.db")
@@ -151,6 +134,7 @@ def RecognizeAndMarkAttendance():
 
     cam = cv2.VideoCapture(0)
     marked = False
+    response = {}
 
     while True:
         ret, img = cam.read()
@@ -174,22 +158,11 @@ def RecognizeAndMarkAttendance():
                                (id_, name, "Present", now))
                 conn.commit()
 
-                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.putText(img, f"{name} | Marked", (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                response = {"id": id_, "name": name, "status": "Present", "timestamp": now}
                 marked = True
-                break  # Stop after first success
-            else:
-                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                cv2.putText(img, "Unknown", (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                break
 
-        cv2.imshow("Recognizing...", img)
         if marked:
-            cv2.waitKey(1000)
-            break
-
-        if cv2.waitKey(1) == 27:
             break
 
     cam.release()
@@ -197,36 +170,33 @@ def RecognizeAndMarkAttendance():
     conn.close()
 
     if marked:
-        messagebox.showinfo("Success", "Attendance marked successfully!")
+        return jsonify(response), 200
     else:
-        messagebox.showwarning("Info", "No known face recognized.")
+        return jsonify({"message": "No known face recognized"}), 404
 
-# --------- GUI ---------
-root = tk.Tk()
-root.title("Face Recognition Attendance System")
-root.geometry("600x400")
-root.resizable(False, False)
+# --------- Get Attendance by Date ---------
+@app.route('/attendance', methods=['GET'])
+def get_attendance_by_date():
+    from_date = request.args.get("from")
+    to_date = request.args.get("to")
 
-ttk.Label(root, text="Face Recognition Attendance System", font=("Helvetica", 16, "bold")).pack(pady=20)
-form = ttk.Frame(root, padding=10)
-form.pack()
+    try:
+        datetime.strptime(from_date, "%Y-%m-%d")
+        datetime.strptime(to_date, "%Y-%m-%d")
+    except:
+        return jsonify({"error": "Date format must be YYYY-MM-DD"}), 400
 
-ttk.Label(form, text="Serial No:", font=("Helvetica", 12)).grid(row=0, column=0, padx=10, pady=5, sticky="e")
-serial_entry = ttk.Entry(form, width=30)
-serial_entry.grid(row=0, column=1, pady=5)
+    conn = sqlite3.connect("attendance_system.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, name, status, timestamp FROM attendance
+        WHERE DATE(timestamp) BETWEEN ? AND ?
+    """, (from_date, to_date))
+    records = cursor.fetchall()
+    conn.close()
 
-ttk.Label(form, text="ID:", font=("Helvetica", 12)).grid(row=1, column=0, padx=10, pady=5, sticky="e")
-id_entry = ttk.Entry(form, width=30)
-id_entry.grid(row=1, column=1, pady=5)
+    return jsonify([{"id": r[0], "name": r[1], "status": r[2], "timestamp": r[3]} for r in records])
 
-ttk.Label(form, text="Name:", font=("Helvetica", 12)).grid(row=2, column=0, padx=10, pady=5, sticky="e")
-name_entry = ttk.Entry(form, width=30)
-name_entry.grid(row=2, column=1, pady=5)
-
-btns = ttk.Frame(root, padding=10)
-btns.pack(pady=10)
-
-ttk.Button(btns, text="Take Image", command=TakeImages).grid(row=0, column=0, padx=10)
-ttk.Button(btns, text="Mark Attendance", command=RecognizeAndMarkAttendance).grid(row=0, column=1, padx=10)
-
-root.mainloop()
+# --------- Run ---------
+if __name__ == "__main__":
+    app.run(debug=True)
